@@ -8,6 +8,7 @@ class BatchCall {
       web3,
       provider,
       groupByNamespace,
+      addBlockInfo,
       logging,
       simplifyResponse,
       store,
@@ -33,6 +34,7 @@ class BatchCall {
     this.abiHashByAddress = {};
     this.abiByHash = {};
     this.groupByNamespace = groupByNamespace;
+    this.addBlockInfo = addBlockInfo;
     this.logging = logging;
     this.simplifyResponse = simplifyResponse;
     this.readContracts = {};
@@ -43,26 +45,10 @@ class BatchCall {
     });
   }
 
-  async execute(contractsBatch, callOptions) {
-    // Constants
+  async execute(contractsBatch, blockNumber) {
     const startTime = Date.now();
-    const blockHeight = _.get(callOptions, "blockHeight", 1);
-    const blockResolution = _.get(callOptions, "blockResolution", 1);
-    const { web3, store, readContracts, groupByNamespace, logging } = this;
     let numberOfMethods = 0;
-    const currentBlockNumber = await web3.eth.getBlockNumber();
-
-    // Build list of blocks to read ("blocks")
-    let blocks = [];
-    let blockNumberIterator = 0;
-    while (blockNumberIterator < blockHeight) {
-      const blockNumber = currentBlockNumber - blockNumberIterator;
-      blocks.push(blockNumber);
-      blockNumberIterator += blockResolution;
-    }
-    blocks = _.reverse(blocks);
-
-    // First level. Add each contractConfig from the batch request
+    const { web3 } = this;
     const addContractToBatch = async (batch, contractConfig) => {
       const {
         addresses,
@@ -71,7 +57,6 @@ class BatchCall {
         readMethods = [],
         allReadMethods,
       } = contractConfig;
-
       const objectToIterateOver = addresses || contracts;
       const addressPromises = await objectToIterateOver.map(
         addAddressToBatch.bind(
@@ -85,7 +70,6 @@ class BatchCall {
       return await Promise.all(addressPromises);
     };
 
-    // Read each address of a contractConfig
     const addAddressToBatch = async (
       batch,
       readMethods,
@@ -96,30 +80,27 @@ class BatchCall {
       const itemIsContract = item.options;
       let address;
       let abi;
-
-      // Fetch ABI from contract or get/build it from store cache
       if (itemIsContract) {
         address = item.options.address;
         abi = item.options.jsonInterface;
       } else {
         address = item;
-        abi = store.getAbiFromCache(address);
+        abi = this.store.getAbiFromCache(address);
       }
 
-      // Initialize the current contract
       const contract = new web3.eth.Contract(abi, address);
 
-      // Get all readable methods from the contract ABI
       let allMethods = _.clone(readMethods);
       if (allReadMethods) {
         const formatField = (name) => ({ name });
-        const allFields = store.getReadableAbiFields(address).map(formatField);
+        const allFields = this.store
+          .getReadableAbiFields(address)
+          .map(formatField);
         allMethods.push(...allFields);
       }
 
-      // Don't read constants more than once
       const filterOutConstants = (method) => {
-        const readContractAtLeastOnce = readContracts[address];
+        const readContractAtLeastOnce = this.readContracts[address];
         const { constant } = method;
         if (constant && readContractAtLeastOnce) {
           return false;
@@ -128,12 +109,11 @@ class BatchCall {
       };
       allMethods = _.filter(allMethods, filterOutConstants);
 
-      // For every method go and asynchronously add the method to the batch
       const methodsPromises = await allMethods.map(
         addMethodToBatch.bind(null, batch, contract, abi, address)
       );
       const methodsState = await Promise.all(methodsPromises);
-      readContracts[address] = true;
+      this.readContracts[address] = true;
       return Promise.resolve({
         address,
         namespace,
@@ -141,103 +121,71 @@ class BatchCall {
       });
     };
 
-    // For every block in "blocks" range and for every contract address read all methods
-    const addBlockToBatch = (
-      batch,
-      args,
-      abiMethod,
-      address,
-      methodCall,
-      name,
-      blockNumber
-    ) =>
-      new Promise((blockResolve) => {
+    const addMethodToBatch = (batch, contract, abi, address, method) =>
+      new Promise((methodResolve) => {
         try {
-          const returnResponse = (blockNumber, err, data) => {
-            if (err && logging) {
+          const { name, args } = method;
+          const abiMethod = _.find(abi, { name });
+
+          let methodCall;
+          const methodExists = _.get(contract.methods, name);
+          if (!methodExists) {
+            return methodResolve();
+          }
+          const nbrAbiArgsForMethod = _.size(abiMethod.inputs);
+
+          /**
+           * In some cases a user may pass args that the ABI does not have. We need to make sure to always pass the
+           * correct number of inputs to our method call
+           */
+          const newArgs = _.take(args, nbrAbiArgsForMethod);
+
+          if (newArgs) {
+            methodCall = contract.methods[name](...newArgs).call;
+          } else {
+            methodCall = contract.methods[name]().call;
+          }
+          numberOfMethods += 1;
+          const returnResponse = (err, data) => {
+            if (err) {
               console.log(
                 `[BatchCall] ${address}: method call failed: ${name}`
               );
             }
-            blockResolve({
-              value: data,
-              blockNumber,
+            const input =
+              args && web3.eth.abi.encodeFunctionCall(abiMethod, newArgs);
+            methodResolve({
+              method: method.name,
+              value: data || "N/A",
+              input,
+              args,
             });
           };
           let req;
-          req = methodCall.request(
-            blockNumber,
-            returnResponse.bind(null, blockNumber)
-          );
-          numberOfMethods += 1;
-
-          // Add the method call to our batch request
+          if (blockNumber) {
+            req = methodCall.request(blockNumber, returnResponse);
+          } else {
+            req = methodCall.request(returnResponse);
+          }
           batch.add(req);
         } catch (err) {
           console.log("method err");
-          blockResolve();
+          methodResolve();
         }
       });
 
-    // Build method response
-    const addMethodToBatch = async (batch, contract, abi, address, method) => {
-      const { name, args } = method;
-      const abiMethod = _.find(abi, { name });
-
-      let methodCall;
-      const methodExists = _.get(contract.methods, name);
-      if (!methodExists) {
-        return Promise.resolve();
-      }
-      const nbrAbiArgsForMethod = _.size(abiMethod.inputs);
-      const newArgs = _.take(args, nbrAbiArgsForMethod);
-
-      // Build method call
-      if (newArgs) {
-        methodCall = contract.methods[name](...newArgs).call;
-      } else {
-        methodCall = contract.methods[name]().call;
-      }
-
-      // Get method input data
-      const input = args && web3.eth.abi.encodeFunctionCall(abiMethod, newArgs);
-
-      // Read method for every block in "blocks" range
-      const blocksPromises = await blocks.map(
-        addBlockToBatch.bind(
-          null,
-          batch,
-          args,
-          abiMethod,
-          address,
-          methodCall,
-          name
-        )
-      );
-      const blocksState = await Promise.all(blocksPromises);
-      readContracts[address] = true;
-      return Promise.resolve({
-        address,
-        input,
-        method: method.name,
-        values: blocksState,
-        args,
-      });
-    };
-
-    // Build contracts state response. Don't allow duplicate addresses, merge data when necessary
     const formatContractsState = (acc, contractConfig) => {
       const addMethodResults = (address, namespace, result) => {
         if (!result) {
           return acc;
         }
-        const { method, values, input, args } = result;
+        const { method, value, input, args } = result;
         const addressResult = _.find(acc, { address }) || {};
         const foundAddressResult = _.size(addressResult);
         const methodArgs = _.get(addressResult, method, []);
         const existingMethodInput = _.find(methodArgs, { input });
         const methodArg = {
-          values,
+          value,
           input,
           args,
         };
@@ -271,11 +219,10 @@ class BatchCall {
       return acc;
     };
 
-    // Build or cache ABIs
     const addAbis = async (contractBatch) => {
       const { abi, addresses } = contractBatch;
       for (const address of addresses) {
-        await store.addAbiToCache(address, abi);
+        await this.store.addAbiToCache(address, abi);
       }
     };
     for (const contractBatch of contractsBatch) {
@@ -285,61 +232,35 @@ class BatchCall {
       }
     }
 
-    // Create batch
     const batch = new web3.BatchRequest();
-
-    // Initial entry point. Start building batch
     const contractsPromises = contractsBatch.map(
       addContractToBatch.bind(null, batch)
     );
 
-    // Execute batch call
     let contractsState;
     batch.execute();
     const contractsPromiseResult = await Promise.all(contractsPromises);
     contractsState = _.reduce(contractsPromiseResult, formatContractsState, []);
+
     let contractsToReturn = contractsState;
 
-    /**
-     * Post-processing
-     */
-    const flattenArgs = (contract) => {
-      const flattenArg = (values, key) => {
-        const valuesIsArr = _.isArray(values);
-        const flattenVal = (value, idx) => {
-          const innerVals = value.values;
-          const onlyOneVal = _.size(innerVals) === 1;
-          if (onlyOneVal) {
-            // Replace "values" with "value" and flatten result when possible. If more than one blocks are read this will not happen
-            contract[key][idx].value = innerVals[0].value;
-            delete contract[key][idx].values;
-          }
-
-          // If only one arg is read and simplifyResponse is true flatten response even further
-          const onlyOneArg = _.size(values) === 1;
-          if (onlyOneArg && this.simplifyResponse) {
-            const { value } = values[0];
-            if (value) {
-              contract[key] = value;
-            } else {
-              contract[key] = _.get(values, `[0].values`);
-            }
+    if (this.simplifyResponse) {
+      const flattenArgs = (contract) => {
+        const flattenArg = (val, key) => {
+          const flattenedVal = val[0].value;
+          if (flattenedVal) {
+            contract[key] = flattenedVal;
           }
         };
-
-        // Only flatten arrays
-        if (valuesIsArr) {
-          _.each(values, flattenVal);
-        }
+        _.each(contract, flattenArg);
+        return contract;
       };
-      _.each(contract, flattenArg);
-      return contract;
-    };
-    contractsToReturn = _.map(contractsToReturn, flattenArgs);
+      contractsToReturn = _.map(contractsToReturn, flattenArgs);
+    }
 
-    // TODO: Test if this still works???
-    if (groupByNamespace) {
+    if (this.groupByNamespace) {
       const contractsStateByNamespace = _.groupBy(contractsState, "namespace");
+
       const removeNamespaceKey = (acc, contracts, key) => {
         const omitNamespace = (contract) => _.omit(contract, "namespace");
         acc[key] = _.map(contracts, omitNamespace);
@@ -352,10 +273,22 @@ class BatchCall {
         {}
       );
       contractsToReturn = contractsStateByNamespaceReduced;
+      if (this.addBlockInfo) {
+        if (contractsToReturn && Object.keys(contractsToReturn).length > 0) {
+          if (!blockNumber) {
+            blockNumber = await web3.eth.getBlockNumber();
+          }
+          const blockInfo = await web3.eth.getBlock(blockNumber);
+          if (blockInfo) {
+            // see complete list here: https://web3js.readthedocs.io/en/v1.3.0/web3-eth.html#id59
+            const allowedFields = ['number', 'hash', 'gasLimit', 'gasUsed', 'timestamp'];
+            contractsToReturn['blockInfo'] = _.pick(blockInfo, allowedFields);
+          }
+        }
+      }
     }
 
-    // Add logging if logging flag is enabled
-    if (logging) {
+    if (this.logging) {
       const endTime = Date.now();
       const executionTime = endTime - startTime;
       console.log(
